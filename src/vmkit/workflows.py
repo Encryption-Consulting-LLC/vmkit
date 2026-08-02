@@ -38,6 +38,7 @@ from vmkit.esxi import (
     power_off_vm,
     power_on_vm,
     register_vm,
+    wait_for_task,
 )
 from vmkit.progress import ProgressCallback, human_bytes
 from vmkit.vmx import DEFAULT_GUEST_OS, parse_guest_os, random_mac, render_vmx
