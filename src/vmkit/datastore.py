@@ -3,16 +3,15 @@ import time
 from pathlib import Path
 from typing import IO
 
-import urllib3
 import requests
 
 from pyVmomi import vim
 
+from vmkit.errors import TaskFailedError
+from vmkit._http import suppress_insecure_warnings
 from vmkit.progress import ProgressCallback, Reporter
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-log = logging.getLogger("deploy-vm")
+log = logging.getLogger(__name__)
 
 
 def make_directory(
@@ -40,6 +39,10 @@ def copy_virtual_disk(
     base: str,
     name: str,
     progress: ProgressCallback | None = None,
+    *,
+    progress_context: str | None = None,
+    timeout_s: float | None = None,
+    should_cancel=None,
 ) -> None:
     """Server-side copy of the base VMDK to the new VM folder."""
     from vmkit.esxi import wait_for_task
@@ -58,7 +61,14 @@ def copy_virtual_disk(
         destDatacenter=dc,
         force=False,
     )
-    wait_for_task(task, "VMDK copy", progress)
+    wait_for_task(
+        task,
+        "VMDK copy",
+        progress,
+        progress_context=progress_context,
+        timeout_s=timeout_s,
+        should_cancel=should_cancel,
+    )
 
 
 def copy_datastore_file(
@@ -69,6 +79,10 @@ def copy_datastore_file(
     name: str,
     ext: str,
     progress: ProgressCallback | None = None,
+    *,
+    progress_context: str | None = None,
+    timeout_s: float | None = None,
+    should_cancel=None,
 ) -> None:
     """Server-side copy of an arbitrary datastore file (e.g. .nvram)."""
     from vmkit.esxi import wait_for_task
@@ -87,7 +101,14 @@ def copy_datastore_file(
         destinationDatacenter=dc,
         force=False,
     )
-    wait_for_task(task, f"{ext} copy", progress)
+    wait_for_task(
+        task,
+        f"{ext} copy",
+        progress,
+        progress_context=progress_context,
+        timeout_s=timeout_s,
+        should_cancel=should_cancel,
+    )
 
 
 def upload_file(
@@ -101,6 +122,9 @@ def upload_file(
     local_path: str,
     remote_filename: str | None = None,
     progress: ProgressCallback | None = None,
+    *,
+    progress_context: str | None = None,
+    verify_tls: bool | str = False,
 ) -> None:
     """Upload a local file to <datastore>/<vm_name>/<remote_filename> via HTTPS PUT."""
     local = Path(local_path)
@@ -125,6 +149,7 @@ def upload_file(
         label=f"upload {remote_filename}",
         total=total,
         unit="B",
+        context=progress_context,
     )
 
     class _ProgressReader:
@@ -140,6 +165,9 @@ def upload_file(
         def __len__(self) -> int:
             return self.total
 
+    if not verify_tls:
+        suppress_insecure_warnings()
+
     reporter.start()
     with open(local, "rb") as fh:
         try:
@@ -151,7 +179,7 @@ def upload_file(
                     "Content-Type": "application/octet-stream",
                     "Content-Length": str(total),
                 },
-                verify=False,
+                verify=verify_tls,
                 timeout=120,
             )
         except Exception as exc:
@@ -159,8 +187,9 @@ def upload_file(
             raise
     if resp.status_code not in (200, 201):
         reporter.fail(f"HTTP {resp.status_code}")
-        raise RuntimeError(
-            f"Upload failed (HTTP {resp.status_code}): {resp.text[:200]}"
+        raise TaskFailedError(
+            f"Upload failed (HTTP {resp.status_code}): {resp.text[:200]}",
+            label=f"upload {remote_filename}",
         )
     reporter.finish()
     log.info("  %s: done", remote_filename)
@@ -174,6 +203,8 @@ def read_datastore_file(
     datastore: str,
     dc_name: str,
     remote_path: str,
+    *,
+    verify_tls: bool | str = False,
 ) -> str:
     """Read a datastore file via HTTPS GET and return its text.
 
@@ -186,15 +217,18 @@ def read_datastore_file(
         f"?dcPath={dc_name}&dsName={datastore}"
     )
     log.info("Reading [%s] %s", datastore, remote_path)
+    if not verify_tls:
+        suppress_insecure_warnings()
     resp = requests.get(
         url,
         auth=(user, password),
-        verify=False,
+        verify=verify_tls,
         timeout=60,
     )
     if resp.status_code != 200:
-        raise RuntimeError(
-            f"Read failed (HTTP {resp.status_code}): {resp.text[:200]}"
+        raise TaskFailedError(
+            f"Read failed (HTTP {resp.status_code}): {resp.text[:200]}",
+            label=f"read {remote_path}",
         )
     return resp.text
 
@@ -219,7 +253,11 @@ def get_base_vmdk_size(datastore_obj: vim.Datastore, base: str) -> int:
     if task_info.state != vim.TaskInfo.State.success:
         err = task_info.error
         msg = task_info.error.msg if err else "unknown error"
-        raise RuntimeError(f"Could not read base VMDK size: {msg}")
+        raise TaskFailedError(
+            f"Could not read base VMDK size: {msg}",
+            label="base VMDK size",
+            fault=err,
+        )
     return sum(
         (getattr(f, "fileSize", 0) or 0) for f in (task_info.result.file or [])
     )
