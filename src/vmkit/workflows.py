@@ -52,8 +52,10 @@ from vmkit.progress import ProgressCallback, StepReporter, human_bytes
 from vmkit.vmx import (
     DEFAULT_GUEST_OS,
     DEFAULT_NETWORK,
+    NIC_PCI_SLOT,
     parse_guest_os,
     parse_network,
+    parse_nic_pci_slot,
     random_mac,
     render_vmx,
 )
@@ -399,6 +401,20 @@ def _read_vmx_text(conn: Connection, datastore: str, dc_name: str, vmx_path: str
         return None
 
 
+def _guest_os_from_vmx(
+    vmx: str | None, vmx_path: str, default: str = DEFAULT_GUEST_OS
+) -> str:
+    """Pick the guestOS id out of already-read VMX text; fall back to ``default``."""
+    if vmx is not None:
+        detected = parse_guest_os(vmx)
+        if detected:
+            return detected
+        log.warning("No guestOS line in %s; defaulting to %s.", vmx_path, default)
+    else:
+        log.warning("Defaulting guest OS to %s.", default)
+    return default
+
+
 def resolve_guest_os(
     conn: Connection,
     datastore: str,
@@ -409,14 +425,29 @@ def resolve_guest_os(
     """Read the guestOS id from the VMX at ``vmx_path``; fall back to ``default``
     (so a Linux base/VM yields a Linux VMX instead of hardcoded Windows)."""
     vmx = _read_vmx_text(conn, datastore, dc_name, vmx_path)
-    if vmx is not None:
-        detected = parse_guest_os(vmx)
-        if detected:
-            return detected
-        log.warning("No guestOS line in %s; defaulting to %s.", vmx_path, default)
-    else:
-        log.warning("Defaulting guest OS to %s.", default)
-    return default
+    return _guest_os_from_vmx(vmx, vmx_path, default)
+
+
+def warn_on_nic_slot_mismatch(vmx: str | None, base: str) -> None:
+    """Warn when ``base``'s NIC sits at a different PCI slot than the clone gets.
+
+    Silent when the VMX could not be read or has no ``ethernet0.pciSlotNumber``
+    line — an unreadable base is already reported by the read itself, and a
+    missing line means ESXi assigns the slot, which we cannot predict.
+    """
+    if vmx is None:
+        return
+    slot = parse_nic_pci_slot(vmx)
+    if slot is None or slot == NIC_PCI_SLOT:
+        return
+    log.warning(
+        "Base '%s' has ethernet0.pciSlotNumber=%s, but this clone is pinned to %s. "
+        "On VMware the guest's interface name derives from that slot, so the clone's "
+        "NIC will be named differently from the base image's. Generated per-VM "
+        "configs detect the NIC at runtime and are unaffected; anything baked into "
+        "the image that names an interface is not.",
+        base, slot, NIC_PCI_SLOT,
+    )
 
 
 def _write_temp_vmx(vmx_content: str) -> str:
@@ -548,9 +579,12 @@ def clone_workflow(
     mac = mac or random_mac(used_macs)
     log.info("MAC address: %s", mac)
 
+    base_vmx_path = f"{base}/{base}.vmx"
+    base_vmx = _read_vmx_text(conn, datastore, dc.name, base_vmx_path)
     if guest_os is None:
-        guest_os = resolve_guest_os(conn, datastore, dc.name, f"{base}/{base}.vmx")
+        guest_os = _guest_os_from_vmx(base_vmx, base_vmx_path)
     log.info("Guest OS: %s", guest_os)
+    warn_on_nic_slot_mismatch(base_vmx, base)
     log.info("Network: %s", network)
 
     iso_filename = f"{name}-config.iso" if iso_path else None

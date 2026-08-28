@@ -9,8 +9,10 @@ from vmkit.errors import VmkitError
 from vmkit.vmx import (
     DEFAULT_GUEST_OS,
     DEFAULT_NETWORK,
+    NIC_PCI_SLOT,
     parse_guest_os,
     parse_network,
+    parse_nic_pci_slot,
     random_mac,
     render_vmx,
 )
@@ -142,6 +144,42 @@ def test_parse_network_returns_none_when_absent(text):
     """Only ethernet0 is the primary NIC; a second adapter must not be mistaken
     for it."""
     assert parse_network(text) is None
+
+
+# --------------------------------------------------------------------------- #
+# parse_nic_pci_slot                                                          #
+# --------------------------------------------------------------------------- #
+def test_render_pins_the_nic_pci_slot():
+    """The guest's interface name derives from this slot, so every clone must get
+    the same one whatever its base looks like."""
+    assert _settings(_render())["ethernet0.pciSlotNumber"] == NIC_PCI_SLOT
+
+
+def test_parse_nic_pci_slot_round_trips_render():
+    assert parse_nic_pci_slot(_render()) == NIC_PCI_SLOT
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ('ethernet0.pciSlotNumber = "34"', "34"),
+        ('  ethernet0.pciSlotNumber="192"', "192"),
+        ('ETHERNET0.PCISLOTNUMBER = "160"', "160"),
+        ('other = "x"\nethernet0.pciSlotNumber = "33"\nmore = "y"', "33"),
+    ],
+)
+def test_parse_nic_pci_slot_tolerates_formatting(text, expected):
+    assert parse_nic_pci_slot(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", 'ethernet1.pciSlotNumber = "45"', 'scsi0.pciSlotNumber = "32"',
+     "ethernet0.pciSlotNumber = 33"],
+)
+def test_parse_nic_pci_slot_returns_none_when_absent(text):
+    """Only ethernet0 -- another device's slot must not be mistaken for the NIC's."""
+    assert parse_nic_pci_slot(text) is None
 
 
 # --------------------------------------------------------------------------- #

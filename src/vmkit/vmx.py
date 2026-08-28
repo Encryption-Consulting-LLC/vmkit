@@ -14,7 +14,16 @@ DEFAULT_GUEST_OS = "windows2022srvNext-64"
 # when first boot never phoned home.
 DEFAULT_NETWORK = "VM Network"
 
+# PCI slot ethernet0 is pinned to in VMX_TEMPLATE. On VMware the guest's
+# predictable interface name derives from this slot (33 -> ens33), so pinning it
+# gives every clone the same NIC name regardless of how its base image was built.
+# A base at a different slot is named differently from its own clones.
+NIC_PCI_SLOT = "33"
+
 _GUEST_OS_RE = re.compile(r'^\s*guestOS\s*=\s*"(.+?)"', re.IGNORECASE | re.MULTILINE)
+_NIC_PCI_SLOT_RE = re.compile(
+    r'^\s*ethernet0\.pciSlotNumber\s*=\s*"(.+?)"', re.IGNORECASE | re.MULTILINE
+)
 _NETWORK_RE = re.compile(
     r'^\s*ethernet0\.networkName\s*=\s*"(.+?)"', re.IGNORECASE | re.MULTILINE
 )
@@ -85,7 +94,7 @@ pciBridge0.virtualDev = "pciRootBridge"
 pciBridge0.functions = "1"
 pciBridge0.pxm = "-1"
 scsi0.pciSlotNumber = "32"
-ethernet0.pciSlotNumber = "33"
+ethernet0.pciSlotNumber = "{nic_pci_slot}"
 usb_xhci.pciSlotNumber = "34"
 sata0.pciSlotNumber = "35"
 migrate.hostlog = "./{hostname}.hlog"
@@ -164,6 +173,16 @@ def parse_network(vmx_text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def parse_nic_pci_slot(vmx_text: str) -> str | None:
+    """Return ``ethernet0.pciSlotNumber`` from VMX text, or None if absent.
+
+    Lets a caller compare a base VM's slot against :data:`NIC_PCI_SLOT` and warn
+    when a clone's NIC will be named differently from the image it came from.
+    """
+    match = _NIC_PCI_SLOT_RE.search(vmx_text)
+    return match.group(1) if match else None
+
+
 def render_vmx(
     hostname: str,
     mac_address: str,
@@ -186,4 +205,5 @@ def render_vmx(
         cdrom_block=cdrom_block,
         guest_os=guest_os,
         network=network,
+        nic_pci_slot=NIC_PCI_SLOT,
     )

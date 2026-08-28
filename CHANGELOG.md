@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.1
+
+Additive apart from one extra datastore read per clone; no call signature changes.
+
+### Added — NIC PCI slot
+
+- `NIC_PCI_SLOT` and `parse_nic_pci_slot(vmx_text)`. `VMX_TEMPLATE` now renders the
+  slot from that constant instead of repeating the literal, so the two cannot drift.
+- `clone_workflow` warns when the base VM's `ethernet0.pciSlotNumber` differs from
+  the slot clones are pinned to. On VMware the guest's predictable interface name
+  derives from that slot (33 -> ens33), so a base built at a different slot boots
+  with a different interface name than every clone made from it. Nothing reported
+  this: the mismatch only surfaces when something baked into the image names an
+  interface, and then it looks like a guest misconfiguration rather than a
+  provisioning one. The slot stays pinned — a fixed slot is what makes clones
+  uniform regardless of how their base was built — so this warns, it does not adapt.
+
+### Changed
+
+- `clone_workflow` now reads the base VMX even when `guest_os` is passed explicitly,
+  since the slot check needs it. Previously that argument skipped the read entirely.
+  An explicit `guest_os` still wins over the VMX's value. Cost is one ~4KB GET
+  against an operation that copies a multi-GB VMDK; an unreadable base VMX is
+  still non-fatal.
+
 ## 0.4.0
 
 Additive: every existing call signature still works, all new parameters default to

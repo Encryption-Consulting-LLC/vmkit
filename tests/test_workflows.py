@@ -6,6 +6,7 @@ register — and getting them out of order produces a VM that registers against 
 disk that is not there yet. An end-state assertion cannot see that.
 """
 
+import logging
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -223,12 +224,14 @@ def test_clone_falls_back_when_the_base_vmx_is_unreadable(conn):
         assert _clone(conn).guest_os == "windows2022srvNext-64"
 
 
-def test_explicit_guest_os_skips_the_vmx_read(conn):
+def test_explicit_guest_os_wins_over_the_vmx(conn):
+    """The base VMX is still read -- the NIC PCI slot check needs it either way --
+    but an explicit guest_os is not overridden by what it says."""
     with patch("vmkit.workflows.upload_file"), patch(
-        "vmkit.workflows.read_datastore_file"
-    ) as read:
+        "vmkit.workflows.read_datastore_file",
+        return_value='guestOS = "ubuntu64Guest"',
+    ):
         assert _clone(conn, guest_os="rhel9_64Guest").guest_os == "rhel9_64Guest"
-    assert not read.called
 
 
 def test_clone_powers_on_when_asked(conn, content, uploads):
@@ -640,3 +643,31 @@ def test_get_vm_config_without_a_nic():
     vm = make_vm("web01")
     vm.config.hardware.device = [MagicMock(spec=vim.VirtualDisk)]
     assert workflows.get_vm_config(vm)["mac"] is None
+
+
+# --------------------------------------------------------------------------- #
+# warn_on_nic_slot_mismatch                                                   #
+# --------------------------------------------------------------------------- #
+def test_nic_slot_mismatch_warns(caplog):
+    """A base built at a different PCI slot boots with a different interface name
+    than its own clones -- silent until something baked into the image names one."""
+    with caplog.at_level(logging.WARNING):
+        workflows.warn_on_nic_slot_mismatch(
+            'ethernet0.pciSlotNumber = "34"', "ub-24.04-base"
+        )
+    assert "ub-24.04-base" in caplog.text
+    assert "34" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "vmx",
+    [
+        None,                                   # base VMX unreadable
+        'ethernet0.pciSlotNumber = "33"',       # matches what the clone gets
+        'guestOS = "ubuntu64Guest"',            # no slot line; ESXi assigns it
+    ],
+)
+def test_nic_slot_mismatch_silent(vmx, caplog):
+    with caplog.at_level(logging.WARNING):
+        workflows.warn_on_nic_slot_mismatch(vmx, "ub-24.04-base")
+    assert caplog.text == ""
