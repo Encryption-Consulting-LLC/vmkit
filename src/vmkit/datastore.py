@@ -7,7 +7,7 @@ import requests
 
 from pyVmomi import vim
 
-from vmkit.errors import TaskFailedError
+from vmkit.errors import TaskFailedError, VmkitError
 from vmkit._http import suppress_insecure_warnings
 from vmkit.progress import ProgressCallback, Reporter
 
@@ -69,6 +69,107 @@ def copy_virtual_disk(
         timeout_s=timeout_s,
         should_cancel=should_cancel,
     )
+
+
+def create_virtual_disk(
+    content: vim.ServiceInstanceContent,
+    dc: vim.Datacenter,
+    datastore: str,
+    name: str,
+    size_gb: int,
+    progress: ProgressCallback | None = None,
+    *,
+    thin: bool = True,
+    progress_context: str | None = None,
+    timeout_s: float | None = None,
+    should_cancel=None,
+) -> None:
+    """Server-side create of a blank ``<name>/<name>.vmdk`` of ``size_gb`` GiB.
+
+    ``thin=False`` allocates the full size up front (lazy-zeroed thick). The
+    descriptor's adapter type is LSI Logic, which is what the API offers for SCSI
+    disks; the VMX's pvscsi controller drives it unchanged.
+    """
+    from vmkit.esxi import wait_for_task
+
+    if size_gb <= 0:
+        raise VmkitError(f"Disk size must be a positive number of GiB, got {size_gb}.")
+    path = f"[{datastore}] {name}/{name}.vmdk"
+    log.info("Creating virtual disk: %s (%d GiB, %s)", path, size_gb, "thin" if thin else "thick")
+    spec = vim.VirtualDiskManager.FileBackedVirtualDiskSpec()
+    spec.diskType = "thin" if thin else "preallocated"
+    spec.adapterType = "lsiLogic"
+    spec.capacityKb = size_gb * 1024 * 1024
+    vdm = content.virtualDiskManager
+    assert vdm is not None
+    task = vdm.CreateVirtualDisk_Task(name=path, datacenter=dc, spec=spec)
+    wait_for_task(
+        task,
+        "VMDK create",
+        progress,
+        progress_context=progress_context,
+        timeout_s=timeout_s,
+        should_cancel=should_cancel,
+    )
+
+
+def split_datastore_path(path: str, default_datastore: str) -> tuple[str, str]:
+    """Split ``"[ds] folder/file.iso"`` into ``("ds", "folder/file.iso")``.
+
+    A path without a ``[datastore]`` prefix is taken as relative to
+    ``default_datastore``. Datastore names may contain spaces and parentheses
+    (``datastore1 (3)``), so the name is everything up to the first ``]``.
+    """
+    path = path.strip()
+    if path.startswith("["):
+        close = path.find("]")
+        if close == -1:
+            raise VmkitError(f"Malformed datastore path (no closing ']'): {path!r}")
+        datastore, rel = path[1:close], path[close + 1 :].strip()
+    else:
+        datastore, rel = default_datastore, path
+    rel = rel.strip("/")
+    if not datastore or not rel:
+        raise VmkitError(f"Datastore path needs a datastore and a file: {path!r}")
+    return datastore, rel
+
+
+def vmfs_path(datastore_obj: vim.Datastore, rel: str) -> str:
+    """The host-side path of ``rel`` on a datastore, as a VMX file reference.
+
+    Uses the datastore's URL (``ds:///vmfs/volumes/<uuid>/``), which is the form
+    the Host Client writes and survives a datastore rename. Falls back to the
+    name-based ``/vmfs/volumes/<name>/`` symlink if the URL is unavailable.
+    """
+    url = getattr(datastore_obj.summary, "url", None)
+    if isinstance(url, str) and url.startswith("ds://"):
+        root = url[len("ds://") :]
+    else:
+        root = f"/vmfs/volumes/{datastore_obj.name}/"
+    return root.rstrip("/") + "/" + rel.strip("/")
+
+
+def datastore_file_exists(datastore_obj: vim.Datastore, rel: str) -> bool:
+    """True if ``rel`` (e.g. ``ISO/ubuntu.iso``) exists on the datastore.
+
+    A missing parent folder counts as a missing file, not an error.
+    """
+    from vmkit.esxi import wait_for_task
+
+    folder, _, filename = rel.strip("/").rpartition("/")
+    ds_folder = f"[{datastore_obj.name}] {folder}" if folder else f"[{datastore_obj.name}]"
+    spec = vim.host.DatastoreBrowser.SearchSpec()
+    spec.matchPattern = [filename]
+    try:
+        task = datastore_obj.browser.SearchDatastore_Task(datastorePath=ds_folder, searchSpec=spec)
+        result = wait_for_task(task, f"find {rel}")
+    except vim.fault.FileNotFound:
+        return False
+    except TaskFailedError as exc:
+        if isinstance(exc.fault, vim.fault.FileNotFound):
+            return False
+        raise
+    return any(getattr(f, "path", None) == filename for f in (result.file or []))
 
 
 def copy_datastore_file(

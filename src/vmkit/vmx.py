@@ -1,5 +1,6 @@
 import random
 import re
+from collections.abc import Sequence
 
 from vmkit.errors import VmkitError
 
@@ -119,11 +120,15 @@ usb_xhci:4.parent = "-1"
 """
 
 _CDROM_BLOCK = (
-    'sata0:0.present = "TRUE"\n'
-    'sata0:0.deviceType = "cdrom-image"\n'
-    'sata0:0.fileName = "{iso_filename}"\n'
-    'sata0:0.startConnected = "TRUE"\n'
+    'sata0:{unit}.present = "TRUE"\n'
+    'sata0:{unit}.deviceType = "cdrom-image"\n'
+    'sata0:{unit}.fileName = "{iso_filename}"\n'
+    'sata0:{unit}.startConnected = "TRUE"\n'
 )
+
+#: CD-ROM drives :func:`render_vmx` will place, one per unit of the template's
+#: single SATA controller (units 0-29).
+MAX_CDROMS = 30
 
 
 def random_mac(existing: set[str] | None = None, attempts: int = 100) -> str:
@@ -191,11 +196,29 @@ def render_vmx(
     iso_filename: str | None = None,
     guest_os: str = DEFAULT_GUEST_OS,
     network: str = DEFAULT_NETWORK,
+    cdroms: Sequence[str] = (),
 ) -> str:
-    cdrom_block = (
-        _CDROM_BLOCK.format(iso_filename=iso_filename)
-        if iso_filename is not None
-        else ""
+    """Render a VMX for ``hostname``.
+
+    ``iso_filename`` attaches one CD-ROM (``sata0:0``), named relative to the VM's
+    own folder -- the clone/update config-ISO case. ``cdroms`` attaches several,
+    in order from ``sata0:0``; each entry is a VMX file path, either relative to
+    the VM folder or absolute (``/vmfs/volumes/<uuid>/ISO/x.iso``), so a VM can
+    boot an ISO kept elsewhere on a datastore. Pass one or the other. EFI tries
+    ``sata0:0`` first on a blank disk, so put the bootable image there.
+    """
+    if iso_filename is not None and cdroms:
+        raise VmkitError("Pass iso_filename or cdroms, not both.")
+    files = [iso_filename] if iso_filename is not None else list(cdroms)
+    if len(files) > MAX_CDROMS:
+        raise VmkitError(f"{len(files)} CD-ROMs requested; the limit is {MAX_CDROMS}.")
+    for f in files:
+        # The value lands inside a quoted VMX line: a quote or newline would end
+        # it early and let the rest be read as further settings.
+        if not f or any(c in f for c in '"\r\n'):
+            raise VmkitError(f"Invalid CD-ROM file path: {f!r}")
+    cdrom_block = "".join(
+        _CDROM_BLOCK.format(unit=unit, iso_filename=f) for unit, f in enumerate(files)
     )
     return VMX_TEMPLATE.format(
         hostname=hostname,

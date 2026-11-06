@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.0
+
+Additive: no existing call signature changes, and `render_vmx`'s output for the
+single-`iso_filename` case is byte-for-byte unchanged.
+
+### Added -- building a VM from scratch
+
+- `create_workflow(conn, *, name, datastore, guest_os, disk_gb, cpus, mem_mb, cdroms=...)`
+  creates a VM with a blank disk from the clone VMX template and registers it, optionally
+  powering it on. It is the base-image counterpart to `clone_workflow`: attach an installer
+  ISO and an autoinstall seed, power on, let the install run. The VM gets the template's
+  pinned NIC PCI slot, so an image built this way has the same interface name as its clones,
+  which a VM made by hand in the Host Client does not. `guest_os` is required -- there is no
+  base VMX to read it from, and the clone default (Windows) is the wrong guess for a fresh
+  install -- in the VMX's naming (`ubuntu-64`). A vSphere API id (`ubuntu64Guest`) is
+  rejected before anything is created: ESXi registers such a VMX without complaint and only
+  refuses it at power-on, after the disk and VMX exist. Returns `CreateResult`.
+- Every ISO passed to `create_workflow` is looked up on its datastore first; a missing one
+  raises the new `DatastoreFileNotFoundError` (a `NotFoundError`) before anything is
+  created. A VM whose CD-ROM points at nothing powers on without complaint and falls
+  through to network boot, which reads as a guest problem rather than a typo.
+- `render_vmx(..., cdroms=[...])` attaches several CD-ROMs from `sata0:0` in order; entries
+  may be absolute host paths, so a VM can boot an ISO kept elsewhere on a datastore.
+  Values that would break out of their quoted VMX line are rejected.
+- `datastore.create_virtual_disk`, `split_datastore_path` (datastore names may contain
+  spaces and parentheses, e.g. `datastore1 (3)`), `vmfs_path` (the `/vmfs/volumes/<uuid>/`
+  form the Host Client writes, from the datastore's URL) and `datastore_file_exists`.
+
 ## 0.5.1
 
 Additive apart from one extra datastore read per clone; no call signature changes.

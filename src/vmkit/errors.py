@@ -68,6 +68,10 @@ class DatacenterNotFoundError(NotFoundError):
     """The host has no datacenter."""
 
 
+class DatastoreFileNotFoundError(NotFoundError):
+    """A file the operation needs (e.g. an ISO to attach) is not on the datastore."""
+
+
 class VmExistsError(VmkitError):
     """A VM with the requested name already exists."""
 

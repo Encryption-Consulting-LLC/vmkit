@@ -151,10 +151,14 @@ def make_datastore(
     ds_type: str = "VMFS",
     accessible: bool = True,
     vmdk_sizes: dict[str, int] | None = None,
+    files: dict[str, list[str]] | None = None,
+    url: str | None = None,
 ):
-    """A vim.Datastore stand-in whose browser answers VMDK size searches.
+    """A vim.Datastore stand-in whose browser answers VMDK size and file searches.
 
     `vmdk_sizes` maps a base VM name to the total size its `*.vmdk` files report.
+    `files` maps a folder ("" for the root) to the file names in it; a search of
+    a folder not in the map fails with FileNotFound, as on a real host.
     """
     ds = MagicMock(spec=vim.Datastore)
     ds.name = name
@@ -163,18 +167,34 @@ def make_datastore(
     ds.summary.freeSpace = free
     ds.summary.type = ds_type
     ds.summary.accessible = accessible
+    ds.summary.url = url if url is not None else f"ds:///vmfs/volumes/uuid-{name}/"
 
     sizes = vmdk_sizes or {}
+    folders = files or {}
 
     def search(datastorePath, searchSpec):
-        # datastorePath looks like "[datastore1] base-vm"
-        base = datastorePath.split("] ", 1)[1]
-        files = []
-        if base in sizes:
-            entry = MagicMock()
-            entry.fileSize = sizes[base]
-            files.append(entry)
-        return FakeTask(running_polls=0, result=MagicMock(file=files))
+        # datastorePath looks like "[datastore1] base-vm", or "[datastore1]" for the root
+        folder = datastorePath.partition("]")[2].strip()
+        pattern = searchSpec.matchPattern[0]
+        found = []
+        if pattern.endswith("*.vmdk"):
+            if folder in sizes:
+                entry = MagicMock()
+                entry.fileSize = sizes[folder]
+                found.append(entry)
+            return FakeTask(running_polls=0, result=MagicMock(file=found))
+        if folder not in folders:
+            return FakeTask(
+                running_polls=0,
+                final_state=vim.TaskInfo.State.error,
+                fault=vim.fault.FileNotFound(),
+            )
+        for fname in folders[folder]:
+            if fname == pattern:
+                entry = MagicMock()
+                entry.path = fname
+                found.append(entry)
+        return FakeTask(running_polls=0, result=MagicMock(file=found))
 
     ds.browser.SearchDatastore_Task = MagicMock(side_effect=search)
     return ds
@@ -241,6 +261,7 @@ class FakeContent:
         self.made_directories: list[tuple[str, str]] = []
         self.deleted_paths: list[str] = []
         self.copied: list[tuple[str, str]] = []
+        self.created_disks: list[tuple[str, object]] = []
 
         self.rootFolder = MagicMock()
         self.rootFolder.childEntity = [self.datacenter]
@@ -262,6 +283,7 @@ class FakeContent:
 
         self.virtualDiskManager = MagicMock()
         self.virtualDiskManager.CopyVirtualDisk_Task = MagicMock(side_effect=self._copy_disk)
+        self.virtualDiskManager.CreateVirtualDisk_Task = MagicMock(side_effect=self._create_disk)
 
     # MagicMock-like attribute autocreation for the few odds and ends
     # (content.about.fullName) the library reads.
@@ -291,6 +313,10 @@ class FakeContent:
 
     def _copy_disk(self, sourceName, sourceDatacenter, destName, destDatacenter, force):
         self.copied.append((sourceName, destName))
+        return FakeTask()
+
+    def _create_disk(self, name, datacenter, spec):
+        self.created_disks.append((name, spec))
         return FakeTask()
 
     def _copy_file(

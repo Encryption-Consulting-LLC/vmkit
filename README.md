@@ -5,17 +5,40 @@ PQC-Playground backend, and bulk provisioning.
 
 Modules:
 - `connect`/`disconnect`, inventory lookups, discovery, register, power on/off, task waiting (`esxi`)
-- server-side datastore file/disk copy, HTTPS upload/download, size queries (`datastore`)
+- server-side datastore file/disk copy and blank-disk create, HTTPS upload/download, size
+  queries, file lookups (`datastore`)
 - VMX template rendering, guest-OS and port-group detection, random VMware MAC (`vmx`)
 - input validators for argparse `type=` (`validate`)
 - structured progress events + logging helpers (`progress`)
-- clone/update/destroy workflows, batch capacity planning, partial-clone cleanup (`workflows`)
+- create/clone/update/destroy workflows, batch capacity planning, partial-clone cleanup (`workflows`)
 
 Library code takes parameters (including credentials) and raises exceptions; it does not
 prompt, print, or call `sys.exit` — those are the caller's concern. Long-running steps
 emit `progress.ProgressEvent`s through an optional `progress` callback (pass `None` to stay
 silent), so the caller decides how to render them, and the lib ships no renderer or `tqdm`
 dependency.
+
+## Building a base VM from scratch
+
+`create_workflow` makes a VM with a blank disk and attaches ISOs that are already on a
+datastore -- the installer first, since EFI boots `sata0:0` on a blank disk. Every ISO is
+checked before anything is created:
+
+```python
+with open_connection(host, user, pw) as conn:
+    create_workflow(
+        conn, name="ub-24.04.5-base-pre", datastore="datastore1 (3)",
+        guest_os="ubuntu-64", disk_gb=40, cpus=2, mem_mb=4096,
+        cdroms=["ISO/ubuntu-autoinstall.iso", "ISO/seed.iso"],  # or "[other-ds] path"
+        power_on=True,
+    )
+```
+
+Once an unattended install is done, `update_workflow(..., remove_iso=True)` re-renders the
+VMX without CD-ROMs, so the installer cannot run again on the next boot.
+
+The VMX comes from the clone template, so the new VM has its clones' hardware --
+including the pinned NIC PCI slot, so its interface name matches theirs.
 
 ## Multi-target use
 
@@ -72,7 +95,7 @@ All errors derive from `VmkitError`. `TaskFailedError` and `NotFoundError` also 
 | ├ `HostUnreachableError` | DNS failure, refused connection, timeout |
 | ├ `TlsError` | Certificate rejected or protocol mismatch |
 | └ `PermissionDeniedError` | Authenticated but not privileged (`vim.fault.NoPermission`) |
-| `NotFoundError` | `VmNotFoundError`, `DatastoreNotFoundError`, `DatacenterNotFoundError` |
+| `NotFoundError` | `VmNotFoundError`, `DatastoreNotFoundError`, `DatacenterNotFoundError`, `DatastoreFileNotFoundError` |
 | `VmExistsError` | Name already in inventory |
 | `InsufficientSpaceError` | Would exceed the datastore free-space limit |
 | `TaskFailedError` | A vSphere task ended non-success; carries `.label` and `.fault` |

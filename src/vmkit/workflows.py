@@ -16,6 +16,7 @@ import logging
 import os
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -24,12 +25,17 @@ from pyVmomi import vim
 from vmkit.datastore import (
     copy_datastore_file,
     copy_virtual_disk,
+    create_virtual_disk,
+    datastore_file_exists,
     get_base_vmdk_size,
     make_directory,
     read_datastore_file,
+    split_datastore_path,
     upload_file,
+    vmfs_path,
 )
 from vmkit.errors import (
+    DatastoreFileNotFoundError,
     InsufficientSpaceError,
     VmExistsError,
     VmkitError,
@@ -52,6 +58,7 @@ from vmkit.progress import ProgressCallback, StepReporter, human_bytes
 from vmkit.vmx import (
     DEFAULT_GUEST_OS,
     DEFAULT_NETWORK,
+    MAX_CDROMS,
     NIC_PCI_SLOT,
     parse_guest_os,
     parse_network,
@@ -153,6 +160,18 @@ class CloneResult:
     total_vms: int
     powered_on: bool
     disk: DiskUsage | None = None
+    network: str = DEFAULT_NETWORK
+
+
+@dataclass
+class CreateResult:
+    name: str
+    mac: str
+    guest_os: str
+    disk_gb: int
+    cdroms: list[str]  # VMX file paths, in sata0:N order
+    total_vms: int
+    powered_on: bool
     network: str = DEFAULT_NETWORK
 
 
@@ -649,6 +668,148 @@ def clone_workflow(
     return CloneResult(
         name=name, mac=mac, guest_os=guest_os,
         total_vms=len(names_after), powered_on=power_on, disk=disk, network=network,
+    )
+
+
+def create_workflow(
+    conn: Connection,
+    *,
+    name: str,
+    datastore: str,
+    guest_os: str,
+    disk_gb: int,
+    cpus: int,
+    mem_mb: int,
+    cdroms: Sequence[str] = (),
+    mac: str | None = None,
+    network: str = DEFAULT_NETWORK,
+    thin: bool = True,
+    power_on: bool = False,
+    progress: ProgressCallback | None = None,
+    progress_context: str | None = None,
+    used_macs: set[str] | None = None,
+    timeout_s: float | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> CreateResult:
+    """Create a new VM with a blank disk and register it -- no base VM involved.
+
+    The from-scratch counterpart of :func:`clone_workflow`, for building a base
+    image: attach an installer ISO (plus, e.g., an autoinstall seed disc), power
+    on, and let an unattended install run. The VMX comes from the same template
+    clones use, so the VM gets the same hardware -- including the pinned NIC PCI
+    slot, which means an image built here has the same interface name as its
+    clones.
+
+    ``cdroms`` are ISOs already on a datastore, attached in order from
+    ``sata0:0`` (put the bootable one first). Each is ``"[datastore] path"`` or a
+    path relative to ``datastore``. Every one is checked up front and a missing
+    one raises ``DatastoreFileNotFoundError`` before anything is created: a VM
+    whose CD points at nothing powers on without complaint and falls through to
+    network boot.
+
+    ``guest_os`` is required, in the VMX's own naming (``ubuntu-64``, not the
+    vSphere API's ``ubuntu64Guest``, which ESXi refuses at power-on): there is no
+    base VMX to read it from, and the clone default (Windows) is the wrong guess
+    for a fresh install. ``disk_gb`` sizes the new disk; ``thin=False`` preallocates it.
+
+    Raises VmExistsError, DatastoreFileNotFoundError, TaskFailedError or
+    VmkitError. On a failure after the datastore directory is created, call
+    :func:`cleanup_partial_clone` to remove the orphaned files.
+    """
+    content = conn.content
+    dc = get_datacenter(content)
+
+    task_kw = dict(
+        progress_context=progress_context,
+        timeout_s=timeout_s,
+        should_cancel=should_cancel,
+    )
+
+    if guest_os.endswith("Guest"):
+        # vSphere API ids (ubuntu64Guest, otherLinux64Guest) all end in "Guest"; VMX
+        # ids (ubuntu-64, otherlinux-64) never do. ESXi registers a VMX carrying an
+        # API id without complaint and only refuses it at power-on, after the disk
+        # and VMX exist -- so catch it before anything is created.
+        raise VmkitError(
+            f"guest_os {guest_os!r} is a vSphere API id; the VMX needs its own form "
+            "(e.g. 'ubuntu-64', 'otherlinux-64', 'rhel9-64')."
+        )
+    assert_vm_unique(content, name)
+    if len(cdroms) > MAX_CDROMS:
+        raise VmkitError(f"{len(cdroms)} CD-ROMs requested; the limit is {MAX_CDROMS}.")
+
+    # Resolve every ISO to the host-side path the VMX needs, checking each exists
+    # before anything is created.
+    vmx_cdroms: list[str] = []
+    datastores: dict[str, vim.Datastore] = {}
+    for spec in cdroms:
+        ds_name, rel = split_datastore_path(spec, datastore)
+        if ds_name not in datastores:
+            datastores[ds_name] = get_datastore(content, ds_name)
+        ds_obj = datastores[ds_name]
+        if not datastore_file_exists(ds_obj, rel):
+            raise DatastoreFileNotFoundError(f"ISO not found on the datastore: [{ds_name}] {rel}")
+        vmx_cdroms.append(vmfs_path(ds_obj, rel))
+        log.info("CD-ROM sata0:%d: [%s] %s", len(vmx_cdroms) - 1, ds_name, rel)
+
+    mac = mac or random_mac(used_macs)
+    log.info("MAC address: %s", mac)
+    log.info("Guest OS: %s", guest_os)
+    log.info("Network: %s", network)
+
+    vmx_content = render_vmx(
+        name, mac, cpus, mem_mb, guest_os=guest_os, network=network, cdroms=vmx_cdroms,
+    )
+
+    # Steps: directory, disk create, vmx upload, register, [power on]
+    total_steps = 4 + (1 if power_on else 0)
+    steps = StepReporter(progress, "create", total_steps, context=progress_context)
+    steps.start()
+    tmp_vmx = None
+    try:
+        make_directory(content, dc, datastore, name)
+        steps.step("directory")
+        create_virtual_disk(
+            content, dc, datastore, name, disk_gb, progress, thin=thin, **task_kw
+        )
+        steps.step("VMDK create")
+
+        tmp_vmx = _write_temp_vmx(vmx_content)
+        upload_file(
+            conn.host, conn.user, conn.password, conn.port,
+            datastore, dc.name, name, tmp_vmx,
+            remote_filename=f"{name}.vmx",
+            progress=progress,
+            progress_context=progress_context,
+            verify_tls=conn.verify_tls,
+        )
+        steps.step("VMX upload")
+
+        register_vm(content, dc, datastore, name, progress, **task_kw)
+        steps.step("register")
+    except Exception as exc:
+        steps.fail(str(exc))
+        raise
+    finally:
+        if tmp_vmx is not None:
+            _unlink_quietly(tmp_vmx)
+
+    log.info("Waiting for inventory to settle ...")
+    time.sleep(3)
+    names_after = list_vm_names(content)
+    if name not in names_after:
+        raise VmkitError(f"VM '{name}' not found in inventory after registration.")
+    log.info("CONFIRMED: VM '%s' is now in inventory.", name)
+
+    if power_on:
+        power_on_vm(content, name, progress, **task_kw)
+        steps.step("power on")
+
+    steps.finish()
+
+    return CreateResult(
+        name=name, mac=mac, guest_os=guest_os, disk_gb=disk_gb, cdroms=vmx_cdroms,
+        total_vms=len(names_after), powered_on=power_on, network=network,
     )
 
 
